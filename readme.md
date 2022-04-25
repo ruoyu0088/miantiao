@@ -14,7 +14,7 @@ from collections import Counter
 import pandas as pd
 
 @pipe
-def word_count(data):
+def word_count(url):
     requests.get()
     P = P.text
     BeautifulSoup('html.parser')
