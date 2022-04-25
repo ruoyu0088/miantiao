@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 import re
 from collections import Counter
 import pandas as pd
+from miantiao import pipe
 
 @pipe
 def word_count(url):
