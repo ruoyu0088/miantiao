@@ -1,4 +1,5 @@
 from pprint import pformat, pprint
+import ctypes
 import sys
 from functools import partial
 from collections import ChainMap
@@ -12,6 +13,44 @@ import linecache
 
 _filename_id = 1
 
+data_arg_position = {
+    'str.join': 1,
+    'builtins.map': 1,
+    'builtins.filter': 1,
+    '_functools.reduce': 1,
+    're.search': 1,
+    're.findall': 1,
+    're.split': 1,
+    're.finditer': 1,
+    're.sub': 1,
+    'itertools.dropwhile': 1,
+    'itertools.filterfalse': 1,
+    'itertools.starmap': 1,
+    'itertools.takewhile': 1,
+}
+
+
+def full_type_name(obj):
+    if not isinstance(obj, type):
+        obj_type = type(obj)
+    else:
+        obj_type = obj
+    return f'{obj_type.__module__}.{obj_type.__qualname__}'
+
+
+def get_full_name(func):
+    try:
+        return func.__module__ + '.' + func.__qualname__
+    except:
+        try:
+            return func.__qualname__
+        except:
+            try:
+                return func.__name__
+            except:
+                return str(func)
+
+
 class Wrap:
     def __init__(self, pipe, data, func, name, pass_data):
         self._pipe = pipe
@@ -22,7 +61,10 @@ class Wrap:
 
     def __call__(self, *args, **kwargs):
         if self._pass_data:
-            res = self._func(self._data, *args, **kwargs)
+            data_pos = data_arg_position.get(get_full_name(self._func), 0)
+            args_list = list(args)
+            args_list.insert(data_pos, self._data)
+            res = self._func(*args_list, **kwargs)
         else:
             res = self._func(*args, **kwargs)
         return self._pipe._set_result(self._name, res)
@@ -60,8 +102,8 @@ class Steps:
             return r[index][1]
 
     def _str_output(self, val):
-        from altair import Chart
-        if isinstance(val, Chart):
+        type_name = full_type_name(val)
+        if type_name == 'altair.vegalite.v4.api.Chart':
             return pformat(val.__dict__)
         else:
             return str(val)
@@ -81,7 +123,6 @@ class Steps:
     def _repr_html_(self):
         from IPython import display
         from IPython.utils.capture import capture_output
-        from pandas import DataFrame
 
         fmt_order = {
             'text/html':lambda x:x,
@@ -91,7 +132,8 @@ class Steps:
         with capture_output() as o:
             for i, (name, step) in enumerate(self.steps):
                 display.display_html(f'<div style="margin-top:10px;"><b>{i:02d}: {name}</b></div>', raw=True)
-                if isinstance(step, DataFrame):
+                type_name = full_type_name(step)
+                if type_name == 'pandas.core.frame.DataFrame':
                     display.display(step.head(10))
                 else:
                     display.display(step)
@@ -111,13 +153,22 @@ class Pipe:
     def __init__(self, data, steps=False):
         self._steps = [] if steps else None
         self._last = data
-        caller_frame = sys._getframe().f_back
+        self._caller_frame = sys._getframe().f_back
+        self._fast_to_local_flag = False
         self._namespace = ChainMap(
-            caller_frame.f_locals, 
-            caller_frame.f_globals,
-            caller_frame.f_builtins)
+            self._caller_frame.f_locals, 
+            self._caller_frame.f_globals,
+            self._caller_frame.f_builtins)
+
+    def _fast_to_local(self):
+        obj_frame = ctypes.py_object(self._caller_frame)
+        ctypes.pythonapi.PyFrame_FastToLocals(obj_frame)        
 
     def __getattr__(self, name):
+        if not self._fast_to_local_flag:
+            self._fast_to_local()
+            self._fast_to_local_flag = True
+
         if name in self._namespace:
             return Wrap(self, self._last, self._namespace[name], name, pass_data=True)    
 
@@ -146,13 +197,29 @@ def get_name(func):
     elif isinstance(func, ast.Attribute):
         return f'{get_name(func.value)}.{func.attr}'
 
+def get_attr_root(e):
+    if isinstance(e, ast.Attribute):
+        return get_attr_root(e.value)
+    elif isinstance(e, ast.Call):
+        return get_attr_root(e.func)
+    elif isinstance(e, ast.Subscript):
+        return get_attr_root(e.value)
+    else:
+        return e
+
 class SearchPlaceholder(ast.NodeVisitor):
     def __init__(self, placeholder):
         self.found = False
         self.placeholder = placeholder
 
     def is_placeholder(self, arg):
-        return is_name(arg, self.placeholder)
+        if is_name(arg, self.placeholder):
+            return True
+
+        if isinstance(arg, ast.Starred) and is_name(arg.value, self.placeholder):
+            return True
+
+        return False
 
     def has_placeholder(self, call):
         if any(self.is_placeholder(arg) for arg in call.args):
@@ -194,8 +261,8 @@ class PipeTransform(ast.NodeTransformer):
             node = self.generic_visit(node)
             body = node.body
             if from_name != '_':
-                body.insert(0, as_ast(f'_pipe._last = P = {from_name}'))
-            body.append(as_ast(f'{to_name} = P'))
+                body.insert(0, as_ast(f'_pipe._last = {self.P} = {from_name}'))
+            body.append(as_ast(f'{to_name} = {self.P}'))
             return body
         else:
             self.nested_func_level += 1
@@ -225,6 +292,14 @@ class PipeTransform(ast.NodeTransformer):
                 return as_ast(f'{self.P} = {self.pipe}._set_result("[]", {ast.unparse(node)})')
             else:
                 return as_ast(f'{self.P} = {self.pipe}.{ast.unparse(node)}')
+
+        elif isinstance(node.value, ast.Attribute):
+            attr_root = get_attr_root(node.value)
+            if self.is_placeholder(attr_root):
+                line_code = ast.unparse(node)
+                return as_ast(f'{self.P} = {self.pipe}._set_result("{line_code}", {line_code})')
+            else:
+                return node
         else:
             return node
 
